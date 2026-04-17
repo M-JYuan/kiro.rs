@@ -30,18 +30,25 @@ pub struct AppState {
     pub profile_arn: Option<String>,
     /// 输入压缩配置（共享引用，支持热更新）
     pub compression_config: Arc<RwLock<CompressionConfig>>,
+    /// 是否启用本地 Prompt Cache usage 记账
+    pub prompt_cache_accounting_enabled: bool,
     /// 缓存追踪器（用于本地模拟 Prompt Caching）
     pub cache_tracker: Arc<CacheTracker>,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, prompt_cache_ttl_seconds: u64) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        prompt_cache_ttl_seconds: u64,
+        prompt_cache_accounting_enabled: bool,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             profile_arn: None,
             compression_config: Arc::new(RwLock::new(CompressionConfig::default())),
+            prompt_cache_accounting_enabled,
             cache_tracker: Arc::new(CacheTracker::new(std::time::Duration::from_secs(
                 prompt_cache_ttl_seconds,
             ))),

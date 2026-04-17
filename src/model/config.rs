@@ -94,6 +94,10 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_ttl_seconds")]
     pub prompt_cache_ttl_seconds: u64,
 
+    /// 是否启用本地 Prompt Cache usage 记账，默认 true
+    #[serde(default = "default_true")]
+    pub prompt_cache_accounting_enabled: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -293,6 +297,7 @@ impl Default for Config {
             credential_rpm: None,
             compression: CompressionConfig::default(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
+            prompt_cache_accounting_enabled: default_true(),
             config_path: None,
         }
     }
@@ -346,5 +351,23 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_defaults_enable_prompt_cache_accounting() {
+        let config = Config::default();
+        assert!(config.prompt_cache_accounting_enabled);
+    }
+
+    #[test]
+    fn test_config_deserializes_prompt_cache_accounting_false() {
+        let config: Config = serde_json::from_str(r#"{"promptCacheAccountingEnabled":false}"#)
+            .expect("config should deserialize");
+        assert!(!config.prompt_cache_accounting_enabled);
     }
 }

@@ -44,8 +44,13 @@ pub fn create_router_with_provider(
     profile_arn: Option<String>,
     compression_config: Arc<RwLock<CompressionConfig>>,
     prompt_cache_ttl_seconds: u64,
+    prompt_cache_accounting_enabled: bool,
 ) -> Router {
-    let mut state = AppState::new(api_key, prompt_cache_ttl_seconds);
+    let mut state = AppState::new(
+        api_key,
+        prompt_cache_ttl_seconds,
+        prompt_cache_accounting_enabled,
+    );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

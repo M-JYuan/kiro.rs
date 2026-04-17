@@ -34,7 +34,7 @@ const ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS: usize = 8192;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{SseEvent, StreamContext};
+use super::stream::{CacheUsageBreakdown, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -50,8 +50,8 @@ struct CacheUsageContext {
 }
 
 struct StreamRequestContext<'a> {
-    cache_tracker: &'a std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>,
-    cache_profile: &'a crate::anthropic::cache_tracker::CacheProfile,
+    cache_tracker: Option<&'a std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
+    cache_profile: Option<&'a crate::anthropic::cache_tracker::CacheProfile>,
     request_body: &'a str,
     model: &'a str,
     input_tokens: i32,
@@ -873,13 +873,20 @@ pub async fn post_messages(
     };
 
     // 检查是否为纯 WebSearch 请求（仅 web_search 单工具 / tool_choice 强制 / 前缀匹配）
+    let websearch_cache_profile = state
+        .prompt_cache_accounting_enabled
+        .then(|| build_cache_profile(&state.cache_tracker, &payload, estimated_input_tokens));
     if websearch::should_handle_websearch_request(&payload) {
         tracing::info!("检测到纯 WebSearch 请求，路由到本地 WebSearch 处理");
         return websearch::handle_websearch_request(
             provider,
             &payload,
-            &state.cache_tracker,
-            &build_cache_profile(&state.cache_tracker, &payload, estimated_input_tokens),
+            if state.prompt_cache_accounting_enabled {
+                Some(&state.cache_tracker)
+            } else {
+                None
+            },
+            websearch_cache_profile.as_ref(),
             estimated_input_tokens,
         )
         .await;
@@ -897,13 +904,19 @@ pub async fn post_messages(
         tracing::info!(stripped, "已剔除空 text content block");
     }
 
-    let cache_profile = build_cache_profile(&state.cache_tracker, &payload, estimated_input_tokens);
-    let provisional_cache_context = provisional_cache_usage(&state.cache_tracker, &cache_profile);
+    let cache_profile = state
+        .prompt_cache_accounting_enabled
+        .then(|| build_cache_profile(&state.cache_tracker, &payload, estimated_input_tokens));
+    let provisional_cache_context = cache_profile
+        .as_ref()
+        .map(|profile| provisional_cache_usage(&state.cache_tracker, profile))
+        .unwrap_or_default();
 
     tracing::info!(
         provisional_cache_creation_input_tokens =
             provisional_cache_context.cache_creation_input_tokens,
         provisional_cache_read_input_tokens = provisional_cache_context.cache_read_input_tokens,
+        cache_accounting_enabled = state.prompt_cache_accounting_enabled,
         "Computed provisional cache usage for /v1/messages"
     );
 
@@ -1055,8 +1068,10 @@ pub async fn post_messages(
     if payload.stream {
         // 流式响应
         let stream_request = StreamRequestContext {
-            cache_tracker: &state.cache_tracker,
-            cache_profile: &cache_profile,
+            cache_tracker: state
+                .prompt_cache_accounting_enabled
+                .then_some(&state.cache_tracker),
+            cache_profile: cache_profile.as_ref(),
             request_body: &request_body,
             model: &payload.model,
             input_tokens: estimated_input_tokens,
@@ -1073,8 +1088,10 @@ pub async fn post_messages(
             input_tokens: estimated_input_tokens,
             tool_name_map,
             user_id: user_id.as_deref(),
-            cache_tracker: Some(&state.cache_tracker),
-            cache_profile: Some(&cache_profile),
+            cache_tracker: state
+                .prompt_cache_accounting_enabled
+                .then_some(&state.cache_tracker),
+            cache_profile: cache_profile.as_ref(),
         };
         handle_non_stream_request(provider, non_stream_request).await
     }
@@ -1092,32 +1109,35 @@ async fn handle_stream_request(
         Err(e) => return map_kiro_provider_error_to_response(context.request_body, e),
     };
 
-    let final_cache_context = resolved_cache_usage(
-        context.cache_tracker,
-        api_result.credential_id,
-        context.cache_profile,
-    );
-    tracing::info!(
-        credential_id = api_result.credential_id,
-        final_cache_creation_input_tokens = final_cache_context.cache_creation_input_tokens,
-        final_cache_read_input_tokens = final_cache_context.cache_read_input_tokens,
-        "Resolved cache usage for stream request"
-    );
-    context
-        .cache_tracker
-        .update(api_result.credential_id, context.cache_profile);
+    let final_cache_context = match (context.cache_tracker, context.cache_profile) {
+        (Some(tracker), Some(profile)) => {
+            let resolved = resolved_cache_usage(tracker, api_result.credential_id, profile);
+            tracing::info!(
+                credential_id = api_result.credential_id,
+                final_cache_creation_input_tokens = resolved.cache_creation_input_tokens,
+                final_cache_read_input_tokens = resolved.cache_read_input_tokens,
+                "Resolved cache usage for stream request"
+            );
+            tracker.update(api_result.credential_id, profile);
+            Some(resolved)
+        }
+        _ => None,
+    };
+    let final_cache_usage = final_cache_context.map(|ctx| CacheUsageBreakdown {
+        cache_creation_input_tokens: ctx.cache_creation_input_tokens,
+        cache_read_input_tokens: ctx.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: ctx.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
+    });
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
         context.model,
         context.input_tokens,
-        final_cache_context.cache_creation_input_tokens,
-        final_cache_context.cache_read_input_tokens,
+        final_cache_usage,
         context.thinking_enabled,
         context.tool_name_map,
     );
-    ctx.cache_creation_5m_input_tokens = final_cache_context.cache_creation_5m_input_tokens;
-    ctx.cache_creation_1h_input_tokens = final_cache_context.cache_creation_1h_input_tokens;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();

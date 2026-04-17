@@ -197,11 +197,16 @@ impl BlockState {
 pub(crate) struct FinalUsage<'a> {
     input_tokens: i32,
     output_tokens: i32,
-    cache_creation_input_tokens: i32,
-    cache_read_input_tokens: i32,
-    cache_creation_5m_input_tokens: i32,
-    cache_creation_1h_input_tokens: i32,
+    cache_usage: Option<CacheUsageBreakdown>,
     metering: Option<&'a MeteringEvent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheUsageBreakdown {
+    pub cache_creation_input_tokens: i32,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
 }
 
 /// SSE 状态管理器
@@ -439,13 +444,16 @@ impl SseStateManager {
             let mut usage_json = json!({
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                "cache_read_input_tokens": usage.cache_read_input_tokens,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
-                    "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
-                }
             });
+            if let Some(cache_usage) = usage.cache_usage {
+                usage_json["cache_creation_input_tokens"] =
+                    json!(cache_usage.cache_creation_input_tokens);
+                usage_json["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
+                usage_json["cache_creation"] = json!({
+                    "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                    "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                });
+            }
             if let Some(metering) = usage.metering {
                 usage_json["credit_usage"] = json!(metering.usage);
                 usage_json["credit_unit"] = json!(metering.unit);
@@ -487,14 +495,8 @@ pub struct StreamContext {
     pub message_id: String,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
-    /// cache 创建输入 tokens
-    pub cache_creation_input_tokens: i32,
-    /// cache 读取输入 tokens
-    pub cache_read_input_tokens: i32,
-    /// cache 创建 5分钟 TTL tokens
-    pub cache_creation_5m_input_tokens: i32,
-    /// cache 创建 1小时 TTL tokens
-    pub cache_creation_1h_input_tokens: i32,
+    /// cache usage 统计（可选）
+    pub cache_usage: Option<CacheUsageBreakdown>,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
@@ -527,8 +529,7 @@ impl StreamContext {
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
-        cache_creation_input_tokens: i32,
-        cache_read_input_tokens: i32,
+        cache_usage: Option<CacheUsageBreakdown>,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
@@ -537,10 +538,7 @@ impl StreamContext {
             model: model.into(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
+            cache_usage,
             context_input_tokens: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
@@ -558,11 +556,24 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let billed_input_tokens = billed_input_tokens(
-            self.input_tokens,
-            self.cache_creation_input_tokens,
-            self.cache_read_input_tokens,
-        );
+        let billed_input_tokens = self
+            .cache_usage
+            .map(|cache_usage| {
+                billed_input_tokens(
+                    self.input_tokens,
+                    cache_usage.cache_creation_input_tokens,
+                    cache_usage.cache_read_input_tokens,
+                )
+            })
+            .unwrap_or(self.input_tokens);
+        let mut usage = json!({
+            "input_tokens": billed_input_tokens,
+            "output_tokens": 1,
+        });
+        if let Some(cache_usage) = self.cache_usage {
+            usage["cache_creation_input_tokens"] = json!(cache_usage.cache_creation_input_tokens);
+            usage["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
+        }
         json!({
             "type": "message_start",
             "message": {
@@ -573,12 +584,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": billed_input_tokens,
-                    "output_tokens": 1,
-                    "cache_creation_input_tokens": self.cache_creation_input_tokens,
-                    "cache_read_input_tokens": self.cache_read_input_tokens
-                }
+                "usage": usage
             }
         })
     }
@@ -1100,11 +1106,16 @@ impl StreamContext {
         // 避免因服务端压缩导致上游 token 统计偏低，使客户端误判上下文大小。
         // credit usage 则仅透传上游 meteringEvent，不影响本地 input/cache usage 语义。
         let final_input_tokens = self.input_tokens;
-        let billed_input_tokens = billed_input_tokens(
-            final_input_tokens,
-            self.cache_creation_input_tokens,
-            self.cache_read_input_tokens,
-        );
+        let billed_input_tokens = self
+            .cache_usage
+            .map(|cache_usage| {
+                billed_input_tokens(
+                    final_input_tokens,
+                    cache_usage.cache_creation_input_tokens,
+                    cache_usage.cache_read_input_tokens,
+                )
+            })
+            .unwrap_or(final_input_tokens);
 
         #[cfg(feature = "sensitive-logs")]
         tracing::info!(
@@ -1123,10 +1134,7 @@ impl StreamContext {
         events.extend(self.state_manager.generate_final_events(FinalUsage {
             input_tokens: billed_input_tokens,
             output_tokens: self.output_tokens,
-            cache_creation_input_tokens: self.cache_creation_input_tokens,
-            cache_read_input_tokens: self.cache_read_input_tokens,
-            cache_creation_5m_input_tokens: self.cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens: self.cache_creation_1h_input_tokens,
+            cache_usage: self.cache_usage,
             metering: self.metering.as_ref(),
         }));
         events
@@ -1169,6 +1177,29 @@ fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zero_cache_usage() -> Option<CacheUsageBreakdown> {
+        Some(CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        })
+    }
+
+    fn cache_usage(
+        cache_creation_input_tokens: i32,
+        cache_read_input_tokens: i32,
+        cache_creation_5m_input_tokens: i32,
+        cache_creation_1h_input_tokens: i32,
+    ) -> Option<CacheUsageBreakdown> {
+        Some(CacheUsageBreakdown {
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens,
+        })
+    }
 
     #[test]
     fn test_sse_event_format() {
@@ -1216,8 +1247,13 @@ mod tests {
 
     #[test]
     fn test_stream_context_includes_metering_in_message_delta_usage() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 123, 0, 0, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            123,
+            zero_cache_usage(),
+            false,
+            HashMap::new(),
+        );
         let initial_events = ctx.generate_initial_events();
         let mut all_events = initial_events;
         ctx.process_kiro_event(&Event::Metering(MeteringEvent {
@@ -1252,8 +1288,13 @@ mod tests {
 
     #[test]
     fn test_stream_context_includes_cache_usage_fields() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 321, 7, 8, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            321,
+            cache_usage(7, 8, 0, 0),
+            false,
+            HashMap::new(),
+        );
         let all_events = ctx.generate_initial_events();
 
         let message_start_usage = all_events
@@ -1268,8 +1309,13 @@ mod tests {
     }
     #[test]
     fn test_stream_context_uses_billed_input_tokens_when_cache_read_present() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 321, 7, 8, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            321,
+            cache_usage(7, 8, 0, 0),
+            false,
+            HashMap::new(),
+        );
         let initial_events = ctx.generate_initial_events();
         let message_start_usage = initial_events
             .iter()
@@ -1290,11 +1336,49 @@ mod tests {
         assert_eq!(message_delta_usage["cache_read_input_tokens"], json!(8));
     }
     #[test]
-    fn test_stream_context_extracts_cache_from_metering_event() {
+    fn test_stream_context_omits_cache_usage_fields_when_disabled() {
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1000, 50, 800, false, HashMap::new());
-        ctx.cache_creation_5m_input_tokens = 30;
-        ctx.cache_creation_1h_input_tokens = 20;
+            StreamContext::new_with_thinking("test-model", 321, None, false, HashMap::new());
+        let initial_events = ctx.generate_initial_events();
+        let message_start_usage = initial_events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .map(|e| e.data["message"]["usage"].clone())
+            .expect("message_start should exist");
+
+        let final_events = ctx.generate_final_events();
+        let message_delta_usage = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["usage"].clone())
+            .expect("message_delta should exist");
+
+        assert_eq!(message_start_usage["input_tokens"], json!(321));
+        assert!(
+            message_start_usage
+                .get("cache_creation_input_tokens")
+                .is_none()
+        );
+        assert!(message_start_usage.get("cache_read_input_tokens").is_none());
+        assert_eq!(message_delta_usage["input_tokens"], json!(321));
+        assert!(
+            message_delta_usage
+                .get("cache_creation_input_tokens")
+                .is_none()
+        );
+        assert!(message_delta_usage.get("cache_read_input_tokens").is_none());
+        assert!(message_delta_usage.get("cache_creation").is_none());
+    }
+
+    #[test]
+    fn test_stream_context_extracts_cache_from_metering_event() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1000,
+            cache_usage(50, 800, 30, 20),
+            false,
+            HashMap::new(),
+        );
 
         ctx.process_kiro_event(&Event::Metering(MeteringEvent {
             unit: "credit".to_string(),
@@ -1327,8 +1411,13 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, 0, 0, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            false,
+            HashMap::new(),
+        );
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1398,8 +1487,13 @@ mod tests {
     #[test]
     fn test_tool_use_only_does_not_emit_empty_text_block() {
         // tool_use-only 的流式响应不应产生空 text block（text=""），否则客户端写回 history 会触发上游校验拒绝
-        let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, 0, 0, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            false,
+            HashMap::new(),
+        );
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.generate_initial_events());
@@ -1431,7 +1525,13 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -1638,7 +1738,13 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1690,7 +1796,13 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1710,7 +1822,13 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -1739,7 +1857,13 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -1771,7 +1895,13 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -1800,7 +1930,13 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
@@ -1848,7 +1984,13 @@ mod tests {
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1871,7 +2013,13 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1893,7 +2041,13 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1917,7 +2071,13 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1950,7 +2110,13 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2005,7 +2171,13 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2026,7 +2198,13 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, 0, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
