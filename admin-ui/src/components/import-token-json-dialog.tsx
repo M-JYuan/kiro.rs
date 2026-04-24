@@ -183,29 +183,60 @@ export function ImportTokenJsonDialog({ open, onOpenChange }: ImportTokenJsonDia
     }
   }, [flattenKamAccount, normalizeKamAccount])
 
+  const readJsonFiles = useCallback(async (files: FileList | File[]) => {
+    const jsonFiles = Array.from(files).filter(file => file.name.endsWith('.json'))
+    if (jsonFiles.length === 0) {
+      toast.error('请上传 JSON 文件')
+      return
+    }
+    if (jsonFiles.length !== Array.from(files).length) {
+      toast.error('仅支持 JSON 文件')
+      return
+    }
+
+    try {
+      const contents = await Promise.all(
+        jsonFiles.map(
+          file => new Promise<string>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = (event) => resolve((event.target?.result as string) || '')
+            reader.onerror = () => reject(new Error(`${file.name} 读取失败`))
+            reader.readAsText(file)
+          })
+        )
+      )
+
+      const mergedItems: TokenJsonItem[] = []
+      for (const content of contents) {
+        const items = parseJson(content)
+        if (!items) {
+          setJsonText('')
+          return
+        }
+        mergedItems.push(...items)
+      }
+
+      setJsonText(JSON.stringify(mergedItems, null, 2))
+      toast.success(`已载入 ${jsonFiles.length} 个 JSON 文件，共 ${mergedItems.length} 条凭据`)
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    }
+  }, [parseJson])
+
   // 文件拖放
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragging(false)
-    const file = e.dataTransfer.files[0]
-    if (!file) return
-    if (!file.name.endsWith('.json')) {
-      toast.error('请上传 JSON 文件')
-      return
-    }
-    const reader = new FileReader()
-    reader.onload = (event) => setJsonText(event.target?.result as string)
-    reader.readAsText(file)
-  }, [])
+    void readJsonFiles(e.dataTransfer.files)
+  }, [readJsonFiles])
 
   // 文件选择
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    const reader = new FileReader()
-    reader.onload = (event) => setJsonText(event.target?.result as string)
-    reader.readAsText(file)
-  }, [])
+    const files = e.target.files
+    if (!files || files.length === 0) return
+    void readJsonFiles(files)
+    e.target.value = ''
+  }, [readJsonFiles])
 
   // 预览（dry-run）
   const handlePreview = useCallback(() => {
@@ -417,15 +448,16 @@ export function ImportTokenJsonDialog({ open, onOpenChange }: ImportTokenJsonDia
               >
                 <Upload className="h-10 w-10 mx-auto mb-4 text-muted-foreground" />
                 <p className="text-sm text-muted-foreground mb-2">
-                  拖放 JSON 文件到此处，或点击选择文件
+                  拖放一个或多个 JSON 文件到此处，或点击选择文件
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  支持单个凭据或凭据数组格式
+                  支持单个凭据、凭据数组和多文件合并导入
                 </p>
                 <input
                   ref={fileInputRef}
                   type="file"
                   accept=".json"
+                  multiple
                   className="hidden"
                   onChange={handleFileSelect}
                 />

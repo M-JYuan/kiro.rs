@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **凭据导入支持多 JSON 文件同时拖入** — Admin 导入凭据弹窗现在支持一次拖拽或选择多个 `.json` 文件，前端会逐个解析并合并为统一的批量导入列表，继续复用现有预览、导入与验活流程 (`admin-ui/src/components/import-token-json-dialog.tsx`)
+
 ## [v1.1.25] - 2026-04-22
 
 ### Added
