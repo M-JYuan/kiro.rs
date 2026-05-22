@@ -229,6 +229,10 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// 当前查询到的超额状态
+    pub overage_enabled: bool,
+    /// 上游返回/兜底后的超额额度上限（未开启时为 0）
+    pub overage_cap: f64,
 }
 
 /// 缓存余额信息
@@ -249,6 +253,10 @@ pub struct CachedBalanceItem {
     pub cached_at: u64,
     /// 缓存存活时间（秒），缓存过期时间 = cached_at + ttl_secs * 1000
     pub ttl_secs: u64,
+    /// 缓存快照里的超额开关状态
+    pub overage_enabled: bool,
+    /// 缓存快照里的超额额度上限（未开启时为 0）
+    pub overage_cap: f64,
 }
 
 /// 所有凭据的缓存余额响应

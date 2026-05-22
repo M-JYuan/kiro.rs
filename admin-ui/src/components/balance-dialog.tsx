@@ -19,6 +19,15 @@ export function BalanceDialog({ credentialId, open, onOpenChange, forceRefresh }
   const { data: balance, isLoading, isFetching, error } = useCredentialBalance(credentialId)
   const showLoading = isLoading || (forceRefresh && isFetching)
 
+  const totalLimit = balance?.usageLimit ?? 0
+  const baseLimit = balance?.overageEnabled
+    ? Math.max(0, totalLimit - (balance.overageCap ?? 0))
+    : totalLimit
+  const overageCap = balance?.overageEnabled ? (balance.overageCap ?? 0) : 0
+  const used = balance?.currentUsage ?? 0
+  const progress = totalLimit > 0 ? Math.min(100, (used / totalLimit) * 100) : 0
+  const overageUsed = Math.max(0, used - baseLimit)
+
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'
     return new Date(timestamp * 1000).toLocaleString('zh-CN')
@@ -74,13 +83,29 @@ export function BalanceDialog({ credentialId, open, onOpenChange, forceRefresh }
             {/* 使用进度 */}
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>已使用: ${formatNumber(used)}</span>
+                <span>总限额: ${formatNumber(totalLimit)}</span>
               </div>
-              <Progress value={balance.usagePercentage} />
+              <Progress value={progress} />
               <div className="text-center text-sm text-muted-foreground">
-                {balance.usagePercentage.toFixed(1)}% 已使用
+                {progress.toFixed(1)}% 已使用
               </div>
+              {balance.overageEnabled && (
+                <div className="rounded-md bg-muted p-2 text-xs space-y-1">
+                  <div className="flex justify-between">
+                    <span>基础额度</span>
+                    <span>${formatNumber(baseLimit)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>超额状态</span>
+                    <span>已开启（额外 ${formatNumber(overageCap)}）</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>已用超额</span>
+                    <span>${formatNumber(overageUsed)}</span>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* 详细信息 */}

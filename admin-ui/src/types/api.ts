@@ -69,6 +69,8 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  overageEnabled: boolean
+  overageCap: number
 }
 
 // 缓存余额信息
@@ -80,6 +82,10 @@ export interface CachedBalanceInfo {
   subscriptionTitle: string | null
   cachedAt: number // Unix 毫秒时间戳
   ttlSecs: number
+  /** 缓存快照里的上游超额状态 */
+  overageEnabled?: boolean
+  /** 缓存快照里的超额额度上限 */
+  overageCap?: number
 }
 
 // 缓存余额响应
@@ -229,7 +235,8 @@ export interface CreditsUsageSummary {
   freeTrialLimit: number
   freeTrialExpiry: string | null
   bonuses: CreditBonus[]
-  nextResetDate: string | null
+  /** epoch 秒（可能带小数），与 Kiro 上游 `nextDateReset` 一致 */
+  nextResetDate: number | null
   overageEnabled: boolean | null
   resourceDetail: CreditsResourceDetail | null
 }
@@ -298,7 +305,8 @@ export interface UsageAndLimitsResponse {
           | null
       }>
     | null
-  nextDateReset: string | null
+  /** epoch 秒（可能带小数），与 Kiro 上游 `nextDateReset` 一致 */
+  nextDateReset: number | null
   overageConfiguration: { overageEnabled: boolean | null } | null
 }
 

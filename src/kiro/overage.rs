@@ -26,24 +26,32 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::kiro::web_portal;
 
 /// 单步事件，序列化后通过 SSE `data:` 字段下发到前端
+///
+/// 注意：`rename_all = "camelCase"` 加在 enum 层只会 rename **变体名**（即 kind 值），
+/// 不会传染到变体内部字段。要让字段也变 camelCase，必须在每个 struct 变体上单独标。
+/// 漏掉这一层会让前端读到一片 undefined。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum OverageEvent {
     /// 准备阶段：拿到 token + idp + profileArn
+    #[serde(rename_all = "camelCase")]
     Prepared { idp: String, has_profile_arn: bool },
     /// 调用 UpdateBillingPreferences 前
     SubmittingUpdate,
     /// UpdateBillingPreferences 成功
     UpdateAccepted,
     /// 进入轮询阶段
+    #[serde(rename_all = "camelCase")]
     PollingStarted { interval_ms: u64, timeout_ms: u64 },
     /// 单次轮询结果
+    #[serde(rename_all = "camelCase")]
     PollTick {
         attempt: u32,
         overage_enabled: Option<bool>,
         elapsed_ms: u64,
     },
     /// 任务成功完成
+    #[serde(rename_all = "camelCase")]
     Done { overage_enabled: bool },
     /// 任务失败，message 是给用户看的简短中文原因
     Error { message: String },
@@ -60,11 +68,12 @@ pub enum OverageEvent {
 pub fn start_overage_stream(
     manager: Arc<MultiTokenManager>,
     credential_id: u64,
+    target_enabled: bool,
 ) -> impl Stream<Item = OverageEvent> + Send + 'static {
     let (tx, rx) = mpsc::channel::<OverageEvent>(16);
 
     tokio::spawn(async move {
-        run(manager, credential_id, tx).await;
+        run(manager, credential_id, target_enabled, tx).await;
     });
 
     ReceiverStream::new(rx)
@@ -74,11 +83,23 @@ pub fn start_overage_stream(
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn run(manager: Arc<MultiTokenManager>, credential_id: u64, tx: mpsc::Sender<OverageEvent>) {
+async fn run(
+    manager: Arc<MultiTokenManager>,
+    credential_id: u64,
+    target_enabled: bool,
+    tx: mpsc::Sender<OverageEvent>,
+) {
     // 任务结束时无论成功失败都要把状态写回 manager
     let mut final_result: Result<bool, String> = Err("任务未完成".to_string());
 
-    let outcome = run_inner(&manager, credential_id, &tx, &mut final_result).await;
+    let outcome = run_inner(
+        &manager,
+        credential_id,
+        target_enabled,
+        &tx,
+        &mut final_result,
+    )
+    .await;
 
     match outcome {
         Ok(()) => {}
@@ -93,6 +114,7 @@ async fn run(manager: Arc<MultiTokenManager>, credential_id: u64, tx: mpsc::Send
 async fn run_inner(
     manager: &Arc<MultiTokenManager>,
     credential_id: u64,
+    target_enabled: bool,
     tx: &mpsc::Sender<OverageEvent>,
     final_result: &mut Result<bool, String>,
 ) -> Result<(), String> {
@@ -125,7 +147,7 @@ async fn run_inner(
         &ctx.token,
         &ctx.idp,
         profile_arn,
-        true,
+        target_enabled,
         ctx.proxy.as_ref(),
     )
     .await
@@ -137,7 +159,7 @@ async fn run_inner(
 
     let _ = tx.send(OverageEvent::UpdateAccepted).await;
 
-    // 3. 轮询 GetUserUsageAndLimits 直到 overageEnabled == true
+    // 3. 轮询 GetUserUsageAndLimits 直到 overageEnabled 达到目标状态
     let _ = tx
         .send(OverageEvent::PollingStarted {
             interval_ms: POLL_INTERVAL.as_millis() as u64,
@@ -172,12 +194,12 @@ async fn run_inner(
             })
             .await;
 
-        if let Some(true) = overage_enabled {
-            manager.record_overage_status(credential_id, true);
-            *final_result = Ok(true);
+        if overage_enabled == Some(target_enabled) {
+            manager.record_overage_status(credential_id, target_enabled);
+            *final_result = Ok(target_enabled);
             let _ = tx
                 .send(OverageEvent::Done {
-                    overage_enabled: true,
+                    overage_enabled: target_enabled,
                 })
                 .await;
             return Ok(());
@@ -185,7 +207,7 @@ async fn run_inner(
 
         if elapsed >= POLL_TIMEOUT {
             let msg = format!(
-                "等待超额状态生效超时（{}s 内未观察到 overageEnabled=true）",
+                "等待超额状态生效超时（{}s 内未观察到目标 overageEnabled 状态）",
                 POLL_TIMEOUT.as_secs()
             );
             *final_result = Err(msg.clone());

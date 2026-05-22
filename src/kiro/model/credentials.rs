@@ -109,6 +109,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idp: Option<String>,
 
+    /// 最近一次已知的超额开关状态（GetUserUsageAndLimits 返回值缓存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub overage_enabled: Option<bool>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -413,6 +418,7 @@ mod tests {
             disabled: false,
             runtime_only: false,
             idp: None,
+            overage_enabled: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -534,6 +540,7 @@ mod tests {
             disabled: false,
             runtime_only: false,
             idp: None,
+            overage_enabled: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -567,6 +574,7 @@ mod tests {
             disabled: false,
             runtime_only: false,
             idp: None,
+            overage_enabled: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -686,6 +694,7 @@ mod tests {
             disabled: false,
             runtime_only: false,
             idp: None,
+            overage_enabled: None,
         };
 
         let json = original.to_pretty_json().unwrap();

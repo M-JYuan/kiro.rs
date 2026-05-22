@@ -144,8 +144,9 @@ export async function getOverageStatus(id: number): Promise<OverageStatusRespons
  * 收到 `done` / `error` 后内部会自动 abort，无需调用方再 close；调用方主动
  * close 也是安全的（重复 abort 是幂等的）。
  */
-export function openOverageEnableStream(
+export function openOverageStream(
   id: number,
+  enabled: boolean,
   onEvent: (event: OverageEvent) => void,
   onError?: (err: unknown) => void
 ): { close: () => void } {
@@ -153,7 +154,7 @@ export function openOverageEnableStream(
   const controller = new AbortController()
   const apiKey = storage.getApiKey() || ''
 
-  fetch(`/api/admin/credentials/${id}/overage/enable`, {
+  fetch(`/api/admin/credentials/${id}/overage/${enabled ? 'enable' : 'disable'}`, {
     method: 'GET',
     headers: {
       Accept: 'text/event-stream',
@@ -205,6 +206,14 @@ export function openOverageEnableStream(
     })
 
   return { close: () => controller.abort() }
+}
+
+export function openOverageEnableStream(
+  id: number,
+  onEvent: (event: OverageEvent) => void,
+  onError?: (err: unknown) => void
+): { close: () => void } {
+  return openOverageStream(id, true, onEvent, onError)
 }
 
 // 强制刷新 Token

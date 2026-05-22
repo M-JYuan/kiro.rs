@@ -270,7 +270,38 @@ pub async fn enable_overage_sse(
     match state.service.try_begin_overage_task(id) {
         Ok(true) => {
             let manager = state.service.token_manager_arc();
-            let stream = overage::start_overage_stream(manager, id).map(|event| {
+            let stream = overage::start_overage_stream(manager, id, true).map(|event| {
+                Event::default()
+                    .json_data(&event)
+                    .or_else(|_| Ok::<Event, std::convert::Infallible>(Event::default()))
+            });
+            Sse::new(stream)
+                .keep_alive(axum::response::sse::KeepAlive::default())
+                .into_response()
+        }
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "overage 任务正在进行中，请稍后再试或刷新查看状态",
+                "credentialId": id,
+            })),
+        )
+            .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/overage/disable - 关闭 overage（SSE 流）
+pub async fn disable_overage_sse(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    match state.service.try_begin_overage_task(id) {
+        Ok(true) => {
+            let manager = state.service.token_manager_arc();
+            let stream = overage::start_overage_stream(manager, id, false).map(|event| {
                 Event::default()
                     .json_data(&event)
                     .or_else(|_| Ok::<Event, std::convert::Infallible>(Event::default()))

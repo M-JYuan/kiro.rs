@@ -250,14 +250,27 @@ impl AdminService {
 
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
+        // 先查缓存。
+        // 但如果缓存里的 overage 状态为 false，而凭据列表里已经从其它路径
+        // （例如 overage SSE 轮询 / GetUserUsageAndLimits 同步）知道它是 true，
+        // 这个缓存就会把“已开启”覆盖成“未开启”。此时必须跳过缓存重新查上游。
         {
             let cache = self.balance_cache.lock();
             if let Some(cached) = cache.get(&id) {
                 let now = Utc::now().timestamp() as f64;
                 if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
+                    let known_overage_enabled = self
+                        .token_manager
+                        .overage_status_for(id)
+                        .ok()
+                        .and_then(|s| s.enabled)
+                        .unwrap_or(false);
+                    if known_overage_enabled && !cached.data.overage_enabled {
+                        tracing::debug!("凭据 #{} 余额缓存 overage 状态过旧，重新查询上游", id);
+                    } else {
+                        tracing::debug!("凭据 #{} 余额命中缓存", id);
+                        return Ok(cached.data.clone());
+                    }
                 }
             }
         }
@@ -290,8 +303,12 @@ impl AdminService {
             .map_err(|e| self.classify_balance_error(e, id))?;
 
         let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
+        let overage_enabled = usage
+            .overage_enabled_reported()
+            .unwrap_or_else(|| self.token_manager.is_overage_known_enabled(id));
+        let usage_limit = usage.effective_usage_limit_for_overage(overage_enabled);
+        let overage_cap = usage.overage_cap_for_enabled(overage_enabled);
+        let remaining = usage.remaining_balance_for_overage(overage_enabled);
         let usage_percentage = if usage_limit > 0.0 {
             (current_usage / usage_limit * 100.0).min(100.0)
         } else {
@@ -299,7 +316,13 @@ impl AdminService {
         };
 
         // 更新缓存，使列表页面能显示最新余额
-        self.token_manager.update_balance_cache(id, remaining);
+        self.token_manager.update_balance_cache_details(
+            id,
+            remaining,
+            usage_limit,
+            Some(overage_enabled),
+            Some(overage_cap),
+        );
 
         Ok(BalanceResponse {
             id,
@@ -309,6 +332,8 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+            overage_enabled,
+            overage_cap,
         })
     }
 
@@ -338,16 +363,26 @@ impl AdminService {
                         subscription_title: cached.data.subscription_title.clone(),
                         cached_at: info.cached_at,
                         ttl_secs: info.ttl_secs,
+                        overage_enabled: cached.data.overage_enabled,
+                        overage_cap: cached.data.overage_cap,
                     }
                 } else {
                     CachedBalanceItem {
                         id,
                         remaining: info.remaining,
-                        usage_limit: 0.0,
-                        usage_percentage: 0.0,
+                        usage_limit: info.usage_limit,
+                        usage_percentage: if info.usage_limit > 0.0 {
+                            ((info.usage_limit - info.remaining).max(0.0) / info.usage_limit
+                                * 100.0)
+                                .min(100.0)
+                        } else {
+                            0.0
+                        },
                         subscription_title: None,
                         cached_at: info.cached_at,
                         ttl_secs: info.ttl_secs,
+                        overage_enabled: info.overage_enabled,
+                        overage_cap: info.overage_cap,
                     }
                 }
             })
@@ -402,6 +437,7 @@ impl AdminService {
             machine_id: req.machine_id,
             endpoint,
             idp: None,
+            overage_enabled: None,
             email: req.email,
             subscription_title: None,
             proxy_url: req.proxy_url,
@@ -726,6 +762,7 @@ impl AdminService {
             machine_id: item.machine_id,
             endpoint: None,
             idp: None,
+            overage_enabled: None,
             email: None,
             subscription_title: None,
             proxy_url: None,

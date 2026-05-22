@@ -220,8 +220,20 @@ impl KiroProvider {
                     }
                     match tm.get_usage_limits_for(id).await {
                         Ok(resp) => {
-                            let remaining = resp.usage_limit() - resp.current_usage();
-                            tm.update_balance_cache(id, remaining);
+                            let overage_enabled = resp
+                                .overage_enabled_reported()
+                                .unwrap_or_else(|| tm.is_overage_known_enabled(id));
+                            let remaining = resp.remaining_balance_for_overage(overage_enabled);
+                            let usage_limit =
+                                resp.effective_usage_limit_for_overage(overage_enabled);
+                            let overage_cap = resp.overage_cap_for_enabled(overage_enabled);
+                            tm.update_balance_cache_details(
+                                id,
+                                remaining,
+                                usage_limit,
+                                Some(overage_enabled),
+                                Some(overage_cap),
+                            );
                             if remaining < 1.0 {
                                 tm.mark_insufficient_balance(id);
                                 tracing::warn!(
@@ -251,8 +263,19 @@ impl KiroProvider {
         tokio::spawn(async move {
             match tm.get_usage_limits_for(id).await {
                 Ok(resp) => {
-                    let remaining = resp.usage_limit() - resp.current_usage();
-                    tm.update_balance_cache(id, remaining);
+                    let overage_enabled = resp
+                        .overage_enabled_reported()
+                        .unwrap_or_else(|| tm.is_overage_known_enabled(id));
+                    let remaining = resp.remaining_balance_for_overage(overage_enabled);
+                    let usage_limit = resp.effective_usage_limit_for_overage(overage_enabled);
+                    let overage_cap = resp.overage_cap_for_enabled(overage_enabled);
+                    tm.update_balance_cache_details(
+                        id,
+                        remaining,
+                        usage_limit,
+                        Some(overage_enabled),
+                        Some(overage_cap),
+                    );
                     tracing::debug!("凭据 #{} 余额缓存已刷新: {:.2}", id, remaining);
                     if remaining < 1.0 {
                         tm.mark_insufficient_balance(id);
@@ -743,7 +766,17 @@ impl KiroProvider {
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
-                self.token_manager.update_balance_cache(ctx.id, 0.0);
+                let quota_entry_disabled = self
+                    .token_manager
+                    .snapshot()
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == ctx.id)
+                    .map(|entry| entry.disabled)
+                    .unwrap_or(false);
+                if quota_entry_disabled {
+                    self.token_manager.update_balance_cache(ctx.id, 0.0);
+                }
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
