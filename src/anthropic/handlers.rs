@@ -187,6 +187,8 @@ fn is_transient_upstream_error(err: &Error) -> bool {
         || s.contains("insufficient_model_capacity")
         || s.contains("high traffic")
         || s.contains("408 request timeout")
+        || s.contains("500 internal server error")
+        || s.contains("encountered an unexpected error")
         || s.contains("502 bad gateway")
         || s.contains("503 service unavailable")
         || s.contains("504 gateway timeout")
@@ -196,6 +198,11 @@ fn is_transient_upstream_error(err: &Error) -> bool {
 fn is_improperly_formed_request_error(err: &Error) -> bool {
     let s = err.to_string();
     s.contains("Improperly formed request")
+}
+
+fn is_invalid_model_id_error(err: &Error) -> bool {
+    let s = err.to_string().to_lowercase();
+    s.contains("invalid_model_id") || s.contains("invalid model")
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -473,6 +480,22 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 "Improperly formed request. This is often caused by oversized payloads, malformed message/tool sequences, or empty content blocks.",
+            )),
+        )
+            .into_response();
+    }
+
+    if is_invalid_model_id_error(&err) {
+        tracing::warn!(
+            error = %err,
+            kiro_request_body_bytes = request_body.len(),
+            "上游拒绝请求：模型在当前凭据上不可用"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "The requested model is unavailable on the current credentials. Try another model or add credentials with model access.",
             )),
         )
             .into_response();
@@ -2057,6 +2080,36 @@ mod tests {
 
         let err = anyhow::anyhow!("所有凭据已用尽");
         assert!(!is_no_credentials_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_upstream_error_includes_500_and_unexpected_error() {
+        let err = anyhow::anyhow!("500 Internal Server Error");
+        assert!(is_transient_upstream_error(&err));
+
+        let err = anyhow::anyhow!("Encountered an unexpected error while serving request");
+        assert!(is_transient_upstream_error(&err));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_error_detects_reason_and_message() {
+        let err = anyhow::anyhow!("400 Bad Request INVALID_MODEL_ID");
+        assert!(is_invalid_model_id_error(&err));
+
+        let err = anyhow::anyhow!("Invalid model: claude-sonnet-4");
+        assert!(is_invalid_model_id_error(&err));
+
+        let err = anyhow::anyhow!("Improperly formed request");
+        assert!(!is_invalid_model_id_error(&err));
+    }
+
+    #[test]
+    fn test_invalid_model_id_maps_to_service_unavailable() {
+        let response = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!("非流式 API 请求失败: 400 INVALID_MODEL_ID"),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

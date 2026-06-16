@@ -269,7 +269,7 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移：
-    /// - 400 Bad Request: 直接返回错误，不计入凭据失败
+    /// - 400 Bad Request: 大部分直接返回；INVALID_MODEL_ID 视为凭据级模型权限问题并尝试故障转移
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
     /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
@@ -290,7 +290,7 @@ impl KiroProvider {
     /// 发送流式 API 请求
     ///
     /// 支持多凭据故障转移：
-    /// - 400 Bad Request: 直接返回错误，不计入凭据失败
+    /// - 400 Bad Request: 大部分直接返回；INVALID_MODEL_ID 视为凭据级模型权限问题并尝试故障转移
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
     /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
@@ -767,7 +767,7 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 400 Bad Request - 大部分是请求问题；INVALID_MODEL_ID 是凭据级模型权限问题
             if status.as_u16() == 400 {
                 let is_too_long = Self::is_input_too_long(&body);
                 // 输入过长错误：只记录请求体大小，不输出完整内容（太占空间且无调试价值）
@@ -782,6 +782,34 @@ impl KiroProvider {
                         estimated_input_tokens = estimated_tokens,
                         "400 Bad Request - 输入上下文过长"
                     );
+                } else if Self::is_invalid_model_id(&body) {
+                    // INVALID_MODEL_ID 通常表示当前凭据没有该模型权限，不禁用凭据，
+                    // 只在本轮请求跳过此凭据，给其他凭据一次兜底机会。
+                    #[cfg(feature = "sensitive-logs")]
+                    let summary = Self::truncate_body_for_log(&body, 256).into_owned();
+                    #[cfg(not(feature = "sensitive-logs"))]
+                    let summary = Self::summarize_error_body(&body);
+
+                    tracing::warn!(
+                        credential_id = %ctx.id,
+                        endpoint = %endpoint_name,
+                        status = %status,
+                        error_summary = %summary,
+                        "{} API 请求失败（疑似该凭据无此模型权限，尝试下一个凭据）",
+                        api_type
+                    );
+
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        summary
+                    ));
+                    failed_ids.push(ctx.id);
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
+                    continue;
                 } else {
                     // 其他 400 错误：记录请求信息以便调试
                     #[cfg(feature = "sensitive-logs")]
@@ -1113,6 +1141,14 @@ impl KiroProvider {
     /// `{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`
     fn is_input_too_long(body: &str) -> bool {
         body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || body.contains("Input is too long")
+    }
+
+    /// 检测是否为「模型 ID 无权限/不可用」类错误
+    ///
+    /// INVALID_MODEL_ID 是凭据级模型权限问题：某个凭据不可用，不代表其他凭据不可用。
+    fn is_invalid_model_id(body: &str) -> bool {
+        let lower = body.to_ascii_lowercase();
+        lower.contains("invalid_model_id") || lower.contains("invalid model")
     }
 
     /// 从上游响应体提取一个适合返回给客户端的错误摘要
@@ -1861,6 +1897,21 @@ mod tests {
     fn test_is_rate_limit_response_false() {
         let body = r#"{"message":"Forbidden","reason":"AUTH_FAILED"}"#;
         assert!(!KiroProvider::is_rate_limit_response(body));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_detects_reason_and_message() {
+        let body = r#"{"message":"Model access denied","reason":"INVALID_MODEL_ID"}"#;
+        assert!(KiroProvider::is_invalid_model_id(body));
+
+        let body = r#"{"message":"Invalid model: claude-sonnet-4"}"#;
+        assert!(KiroProvider::is_invalid_model_id(body));
+
+        let body = r#"{"message":"invalid MODEL for this credential"}"#;
+        assert!(KiroProvider::is_invalid_model_id(body));
+
+        let body = r#"{"message":"Improperly formed request","reason":"BAD_REQUEST"}"#;
+        assert!(!KiroProvider::is_invalid_model_id(body));
     }
 
     #[test]
