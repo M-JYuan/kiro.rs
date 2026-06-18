@@ -1850,10 +1850,14 @@ mod tests {
     /// Pre-fix double-wrapping broke the prefix-cache key.
     #[test]
     fn test_wrap_system_for_history_idempotent() {
-        let already_wrapped = "--- CONTEXT ENTRY BEGIN ---\n--- CONTEXT ENTRY END ---\n\nFollow this instruction: hi";
+        let already_wrapped =
+            "--- CONTEXT ENTRY BEGIN ---\n--- CONTEXT ENTRY END ---\n\nFollow this instruction: hi";
         assert_eq!(wrap_system_for_history(already_wrapped), already_wrapped);
         let with_follow_prefix = "Follow this instruction: hi";
-        assert_eq!(wrap_system_for_history(with_follow_prefix), with_follow_prefix);
+        assert_eq!(
+            wrap_system_for_history(with_follow_prefix),
+            with_follow_prefix
+        );
         // Whitespace at the head must not break detection.
         let leading_ws = "  Follow this instruction: hi";
         assert_eq!(wrap_system_for_history(leading_ws), leading_ws);
@@ -1882,7 +1886,10 @@ mod tests {
         // → same fingerprint as turn 1.
         let turn2 = vec![mk("user", "hi"), mk("assistant", "yo"), mk("user", "again")];
         let fp_turn2 = messages_history_fingerprint(&turn2).unwrap();
-        assert_eq!(fp_single, fp_turn2, "first-message anchor must persist across turns");
+        assert_eq!(
+            fp_single, fp_turn2,
+            "first-message anchor must persist across turns"
+        );
 
         // Turn 5 of same session — history grew further, fingerprint unchanged.
         let turn5 = vec![
@@ -1895,7 +1902,10 @@ mod tests {
             mk("user", "current"),
         ];
         let fp_turn5 = messages_history_fingerprint(&turn5).unwrap();
-        assert_eq!(fp_single, fp_turn5, "same first-message → same fingerprint regardless of history length");
+        assert_eq!(
+            fp_single, fp_turn5,
+            "same first-message → same fingerprint regardless of history length"
+        );
 
         // Different session (different first message) → different fingerprint.
         let other = vec![mk("user", "different first message")];
@@ -2815,9 +2825,21 @@ mod tests {
                 .current_message
                 .user_input_message
                 .images;
-            assert_eq!(imgs.len(), 1, "media_type {} should yield 1 image", media_type);
-            assert_eq!(imgs[0].format, *expected_format, "format mapping for {}", media_type);
-            assert!(!imgs[0].source.bytes.is_empty(), "source.bytes must be populated");
+            assert_eq!(
+                imgs.len(),
+                1,
+                "media_type {} should yield 1 image",
+                media_type
+            );
+            assert_eq!(
+                imgs[0].format, *expected_format,
+                "format mapping for {}",
+                media_type
+            );
+            assert!(
+                !imgs[0].source.bytes.is_empty(),
+                "source.bytes must be populated"
+            );
         }
     }
 
@@ -2841,7 +2863,10 @@ mod tests {
             "missing additionalProperties must NOT be auto-injected"
         );
         // But type/properties/required still ensured present (these treat MCP anomalies).
-        assert_eq!(normalized.get("type").and_then(|v| v.as_str()), Some("object"));
+        assert_eq!(
+            normalized.get("type").and_then(|v| v.as_str()),
+            Some("object")
+        );
         assert!(normalized.get("properties").is_some());
         assert!(normalized.get("required").is_some());
     }

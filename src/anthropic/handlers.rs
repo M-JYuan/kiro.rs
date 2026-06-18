@@ -643,7 +643,11 @@ fn extract_thinking_xml(text: &str) -> (String, String) {
         // 标签前的内容保留到 cleaned
         cleaned.push_str(&text[cursor..open_abs]);
         // 标签内容（trim 两端换行）追加到 thinking_parts
-        thinking_parts.push(text[content_start..close_abs].trim_matches('\n').to_string());
+        thinking_parts.push(
+            text[content_start..close_abs]
+                .trim_matches('\n')
+                .to_string(),
+        );
 
         cursor = close_abs + CLOSE.len();
         // 吞掉标签后紧跟的两个换行（模型常用 `</thinking>\n\n` 作分隔符）
