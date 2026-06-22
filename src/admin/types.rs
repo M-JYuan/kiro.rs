@@ -56,6 +56,20 @@ pub struct CredentialStatusItem {
     pub endpoint: Option<String>,
     /// 最终生效的 endpoint 名称
     pub effective_endpoint: String,
+    /// Web Portal Idp 标识（默认推断为 Google）
+    pub idp: Option<String>,
+    /// 凭据级代理 URL（None 表示回退到全局代理；"direct" 表示显式直连）
+    pub proxy_url: Option<String>,
+    /// 凭据级代理认证用户名
+    pub proxy_username: Option<String>,
+    /// 是否设置了凭据级代理密码（不返回明文）
+    pub has_proxy_password: bool,
+    /// 最近一次已知的超额开关状态（None 表示未知）
+    pub overage_enabled: Option<bool>,
+    /// 是否正在执行后台开启超额任务
+    pub overage_enabling: bool,
+    /// 最近一次开启超额失败原因
+    pub overage_last_error: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -92,6 +106,39 @@ pub struct SetRegionRequest {
 pub struct SetEndpointRequest {
     /// endpoint 名称，空字符串或 null 表示回退到 defaultEndpoint
     pub endpoint: Option<String>,
+}
+
+/// 修改凭据级 Web Portal Idp 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetIdpRequest {
+    /// idp 名称（如 "Google"），空字符串或 null 表示清除并回退到默认
+    pub idp: Option<String>,
+}
+
+/// 修改凭据级代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxyRequest {
+    /// 代理 URL（http/https/socks5），空字符串表示清除回退到全局；
+    /// 特殊值 "direct" 表示显式直连。
+    pub proxy_url: Option<String>,
+    /// 代理用户名（可选）
+    pub proxy_username: Option<String>,
+    /// 代理密码（可选；不会被返回到响应）
+    pub proxy_password: Option<String>,
+}
+
+/// 单凭据 overage 状态响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageStatusResponse {
+    pub id: u64,
+    pub enabled: Option<bool>,
+    pub enabling: bool,
+    pub last_error: Option<String>,
+    pub has_profile_arn: bool,
+    pub auth_method: Option<String>,
 }
 
 /// 添加凭据请求
@@ -182,6 +229,10 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// 当前查询到的超额状态
+    pub overage_enabled: bool,
+    /// 上游返回/兜底后的超额额度上限（未开启时为 0）
+    pub overage_cap: f64,
 }
 
 /// 缓存余额信息
@@ -202,6 +253,10 @@ pub struct CachedBalanceItem {
     pub cached_at: u64,
     /// 缓存存活时间（秒），缓存过期时间 = cached_at + ttl_secs * 1000
     pub ttl_secs: u64,
+    /// 缓存快照里的超额开关状态
+    pub overage_enabled: bool,
+    /// 缓存快照里的超额额度上限（未开启时为 0）
+    pub overage_cap: f64,
 }
 
 /// 所有凭据的缓存余额响应

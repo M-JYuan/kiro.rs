@@ -198,17 +198,16 @@ impl CliEndpoint {
             .and_then(|v| v.get_mut("userInputMessage"))
             .and_then(|v| v.get_mut("userInputMessageContext"))
             .and_then(|v| v.as_object_mut())
+            && !ctx.contains_key("envState")
         {
-            if !ctx.contains_key("envState") {
-                // Insert envState at the head so it precedes `tools` (matches
-                // wire order). serde_json::Map preserves insertion order.
-                let mut new_ctx = serde_json::Map::new();
-                new_ctx.insert("envState".to_string(), env_state.clone());
-                for (k, v) in ctx.iter() {
-                    new_ctx.insert(k.clone(), v.clone());
-                }
-                *ctx = new_ctx;
+            // Insert envState at the head so it precedes `tools` (matches
+            // wire order). serde_json::Map preserves insertion order.
+            let mut new_ctx = serde_json::Map::new();
+            new_ctx.insert("envState".to_string(), env_state.clone());
+            for (k, v) in ctx.iter() {
+                new_ctx.insert(k.clone(), v.clone());
             }
+            *ctx = new_ctx;
         }
 
         // history[*].userInputMessage.userInputMessageContext.envState

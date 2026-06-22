@@ -15,6 +15,11 @@
 - **P0#3 周期 balance 刷新**：原版实测 24h 0 条 balance refresh log，cache 完全是启动时快照。Fork 加 10 分钟周期刷新 + 余额不足主动禁用。
 - **P0#4 cache_tracker TTL 对齐上游**：原版命中时刷新 `expires_at`，但 Anthropic 真实 TTL 从首次写入算。Fork 修复后 `cache_read` 数字与上游真实命中率一致。
 - **credentialRpm: 0 真禁用本地限流**：原版 `0` 会落回默认 1-2 秒间隔 + 每日 500 上限（与字面意思相反）。Fork 让 `0` 真的跳过所有本地限流检查。
+- **凭据级 IdP/代理/Admin Portal 设置**：Admin UI 支持编辑凭据级 Auth/API Region、IdC `clientId/clientSecret`、HTTP/SOCKS5 代理与 `direct` 直连覆盖。
+- **Overages 在线启停与状态同步**：Admin UI 支持 SSE 实时开启/关闭 Overages；后端会从 Web Portal 与 `GetUserUsageAndLimits` 同步 overage 状态，并持久化到凭据。
+- **Overage-aware 余额与自动禁用**：余额展示、缓存与自动禁用逻辑使用“基础额度 + 超额额度”的有效额度；上游未返回 `overageEnabled` 时不会误判为关闭。
+- **Admin 详情页白屏修复与全局模型列表**：修复凭据详情渲染问题；固定 `/v1/models` 能力列表不再在每个凭据详情重复显示，改为 Admin 顶部全局“可用模型”。
+- **Thinking 兼容增强**：`claude-opus-4-7-thinking` 与 `claude-opus-4-6-thinking` 一样走 adaptive thinking；客户端即使选择不带 `-thinking` 的模型，只要请求带 `thinking` 参数也会启用思考。
 - **CI 简化**：删除 Linux/macOS/Windows 二进制 release workflow，仅保留 Docker Hub 自动构建（push tag `v*` 触发）。
 
 镜像：`myuan6/kiro-rs:latest`（不含本次修复的请用上游镜像 `ghcr.io/hank9999/kiro-rs:latest`）。
@@ -42,12 +47,14 @@
 - **智能重试**: 单凭据最多重试 2 次，单请求最多重试 3 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
+- **客户端 Thinking 参数兼容**: 模型名不带 `-thinking` 时，只要请求携带 `thinking` 参数也会启用思考；无效预算默认 high
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
-- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
+- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询、Overages 启停、凭据级配置等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
+- **Overage-aware 额度**: 支持读取、缓存并展示基础额度 + 超额额度的有效余额，避免误禁用已开启 Overages 的凭据
 
 ---
 
@@ -71,6 +78,8 @@
   - [工具调用](#工具调用)
 - [模型映射](#模型映射)
 - [Admin（可选）](#admin可选)
+  - [Admin UI 功能](#admin-ui-功能)
+  - [Admin API](#admin-api)
 - [注意事项](#注意事项)
 - [项目结构](#项目结构)
 - [技术栈](#技术栈)
@@ -282,6 +291,8 @@ docker compose up -d --build
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
+| `overageEnabled` | boolean | 是否已知开启 Overages（由 Admin/Web Portal/usage 查询自动同步，也可手动保留） |
+| `overageCap`   | number | Overages 超额额度上限（未配置时使用默认值）                 |
 
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
@@ -338,6 +349,7 @@ docker compose up -d --build
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
+- Admin UI 修改凭据级 Region、IdC、代理或 Overages 状态后会自动回写到源文件
 
 ### Region 配置
 
@@ -432,6 +444,14 @@ RUST_LOG=debug ./target/release/kiro-rs
 }
 ```
 
+Thinking 配置规则：
+
+- 模型名带 `-thinking` 后缀时会自动启用 thinking。
+- 支持强度后缀：`-thinking-minimal`、`-thinking-low`、`-thinking-medium`、`-thinking-high`、`-thinking-xhigh`。
+- 对 `claude-opus-4-6-thinking`、`claude-opus-4-7-thinking`、`claude-sonnet-4-6-thinking` 使用 Kiro 侧需要的 `adaptive` thinking，并设置 `output_config.effort = "high"`。
+- 模型名不带 `-thinking` 时，只要客户端请求携带 `thinking` 参数也会启用思考；`budget_tokens` 使用客户端传入值。
+- 如果客户端携带 `thinking` 但预算缺失、为 `0` 或无效，则默认按 high 使用 `24576`。
+
 ### 工具调用
 
 完整支持 Anthropic 的 tool use 功能：
@@ -459,6 +479,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
+`GET /v1/models` 返回当前服务固定暴露的模型能力列表；该列表不按单个凭据动态区分。Admin UI 顶部“可用模型”弹窗展示的也是这个全局列表。
+
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
 | `*sonnet*`（含 4-6/4.6） | `claude-sonnet-4.6` |
@@ -469,20 +491,33 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## Admin（可选）
 
-当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
+当 `config.json` 配置了非空 `adminApiKey` 时，会启用 Web 管理界面与 Admin API。Admin 认证同时支持 `x-api-key` 和 `Authorization: Bearer`。
 
-- **Admin API（认证同 API Key）**
-  - `GET /api/admin/credentials` - 获取所有凭据状态
-  - `POST /api/admin/credentials` - 添加新凭据
-  - `DELETE /api/admin/credentials/:id` - 删除凭据
-  - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
-  - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
-  - `POST /api/admin/credentials/:id/region` - 设置凭据 Region
-  - `POST /api/admin/credentials/:id/reset` - 重置失败计数
-  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+### Admin UI 功能
 
-- **Admin UI**
-  - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+- `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）。
+- 凭据列表：查看启用状态、优先级、邮箱、Region、代理、余额、Overages 状态与失败计数。
+- 凭据详情：查看账号信息、余额、Region、IdC 与代理配置；避免在每个凭据详情重复展示固定模型列表。
+- 凭据编辑：支持修改凭据级 Auth/API Region、IdC `clientId/clientSecret`、HTTP/SOCKS5 代理；`proxyUrl: "direct"` 表示该凭据显式直连。
+- Overages 管理：支持从 Admin UI 发起开启/关闭 Overages，并通过 SSE 展示实时进度；成功后状态会同步到凭据文件。
+- 余额管理：单凭据实时查询余额；列表页使用缓存余额，缓存包含有效总额度、剩余额度、Overages 开关和超额上限。
+- 全局可用模型：顶部“可用模型”展示 `/v1/models` 暴露的固定模型集合。该列表是服务能力列表，不按单个凭据区分。
+
+### Admin API
+
+- `GET /api/admin/credentials` - 获取所有凭据状态
+- `POST /api/admin/credentials` - 添加新凭据
+- `DELETE /api/admin/credentials/:id` - 删除凭据
+- `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
+- `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
+- `POST /api/admin/credentials/:id/region` - 设置凭据 Region
+- `POST /api/admin/credentials/:id/reset` - 重置失败计数
+- `GET /api/admin/credentials/:id/balance` - 实时获取凭据余额并更新缓存
+- `GET /api/admin/credentials/balances/cached` - 获取所有凭据缓存余额
+- `GET /api/admin/credentials/:id/overage/status` - 获取凭据 Overages 状态
+- `POST /api/admin/credentials/:id/overage/enable` - 开启 Overages（SSE）
+- `POST /api/admin/credentials/:id/overage/disable` - 关闭 Overages（SSE）
+- `POST /api/admin/credentials/:id/portal-settings` - 更新凭据级 Admin Portal 设置（Region / IdC / 代理等）
 
 ## 注意事项
 

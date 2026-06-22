@@ -36,7 +36,6 @@ export interface CredentialStatusItem {
   successCount: number
   lastUsedAt: string | null
   hasProxy: boolean
-  proxyUrl?: string
   /** 凭据级 Region（用于 Token 刷新） */
   region: string | null
   /** 凭据级 API Region（单独覆盖 API 请求） */
@@ -45,6 +44,20 @@ export interface CredentialStatusItem {
   endpoint?: string | null
   /** 最终生效的 endpoint */
   effectiveEndpoint: string
+  /** Web Portal Idp 标识（默认推断为 Google） */
+  idp?: string | null
+  /** 凭据级代理 URL（null 表示回退到全局代理；"direct" 表示显式直连） */
+  proxyUrl?: string | null
+  /** 凭据级代理用户名 */
+  proxyUsername?: string | null
+  /** 是否设置了凭据级代理密码（不返回明文） */
+  hasProxyPassword?: boolean
+  /** 最近一次已知的超额开关状态（null 表示未知） */
+  overageEnabled?: boolean | null
+  /** 是否正在执行后台开启超额任务 */
+  overageEnabling?: boolean
+  /** 最近一次开启超额失败原因 */
+  overageLastError?: string | null
 }
 
 // 余额响应
@@ -56,6 +69,8 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  overageEnabled: boolean
+  overageCap: number
 }
 
 // 缓存余额信息
@@ -67,6 +82,10 @@ export interface CachedBalanceInfo {
   subscriptionTitle: string | null
   cachedAt: number // Unix 毫秒时间戳
   ttlSecs: number
+  /** 缓存快照里的上游超额状态 */
+  overageEnabled?: boolean
+  /** 缓存快照里的超额额度上限 */
+  overageCap?: number
 }
 
 // 缓存余额响应
@@ -132,6 +151,34 @@ export interface SetEndpointRequest {
   endpoint: string | null
 }
 
+export interface SetIdpRequest {
+  idp: string | null
+}
+
+export interface SetCredentialProxyRequest {
+  proxyUrl: string | null
+  proxyUsername?: string | null
+  proxyPassword?: string | null
+}
+
+export interface OverageStatusResponse {
+  id: number
+  enabled: boolean | null
+  enabling: boolean
+  lastError: string | null
+  hasProfileArn: boolean
+  authMethod: string | null
+}
+
+export type OverageEvent =
+  | { kind: 'prepared'; idp: string; hasProfileArn: boolean }
+  | { kind: 'submittingUpdate' }
+  | { kind: 'updateAccepted' }
+  | { kind: 'pollingStarted'; intervalMs: number; timeoutMs: number }
+  | { kind: 'pollTick'; attempt: number; overageEnabled: boolean | null; elapsedMs: number }
+  | { kind: 'done'; overageEnabled: boolean }
+  | { kind: 'error'; message: string }
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -188,7 +235,8 @@ export interface CreditsUsageSummary {
   freeTrialLimit: number
   freeTrialExpiry: string | null
   bonuses: CreditBonus[]
-  nextResetDate: string | null
+  /** epoch 秒（可能带小数），与 Kiro 上游 `nextDateReset` 一致 */
+  nextResetDate: number | null
   overageEnabled: boolean | null
   resourceDetail: CreditsResourceDetail | null
 }
@@ -257,7 +305,8 @@ export interface UsageAndLimitsResponse {
           | null
       }>
     | null
-  nextDateReset: string | null
+  /** epoch 秒（可能带小数），与 Kiro 上游 `nextDateReset` 一致 */
+  nextDateReset: number | null
   overageConfiguration: { overageEnabled: boolean | null } | null
 }
 

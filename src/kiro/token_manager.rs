@@ -39,7 +39,7 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
-use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::model::usage_limits::{DEFAULT_OVERAGE_CAP, UsageLimitsResponse};
 use crate::kiro::rate_limiter::{RateLimitConfig, RateLimiter};
 use crate::model::config::Config;
 
@@ -554,6 +554,12 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希缓存（避免 snapshot 重复计算）
     refresh_token_hash: Option<String>,
+    /// 最近一次已知的超额开关状态（GetUserUsageAndLimits 返回值缓存）
+    overage_enabled: Option<bool>,
+    /// 是否正在执行后台开启超额任务（防止重复开启）
+    overage_enabling: bool,
+    /// 最近一次开启超额失败原因
+    overage_last_error: Option<String>,
 }
 
 /// 自愈原因（内部使用，用于判断是否可自动恢复）
@@ -617,6 +623,20 @@ pub struct CredentialEntrySnapshot {
     pub api_region: Option<String>,
     /// 最终生效的 endpoint 名称
     pub endpoint: Option<String>,
+    /// Web Portal Idp 标识（默认推断为 Google）
+    pub idp: Option<String>,
+    /// 凭据级代理 URL（None 表示回退到全局代理）
+    pub proxy_url: Option<String>,
+    /// 凭据级代理用户名
+    pub proxy_username: Option<String>,
+    /// 凭据级代理是否设置了密码（不返回明文）
+    pub has_proxy_password: bool,
+    /// 最近一次已知的超额开关状态
+    pub overage_enabled: Option<bool>,
+    /// 是否正在执行后台开启超额任务
+    pub overage_enabling: bool,
+    /// 最近一次开启超额失败原因
+    pub overage_last_error: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -631,6 +651,37 @@ pub struct ManagerSnapshot {
     pub available: usize,
 }
 
+/// 单凭据 overage 状态快照
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageStatusSnapshot {
+    pub id: u64,
+    /// 最近一次已知的 overage 开关状态（None 表示未知，未调用过 GetUserUsageAndLimits）
+    pub enabled: Option<bool>,
+    /// 是否正在执行后台开启任务
+    pub enabling: bool,
+    /// 最近一次开启失败原因
+    pub last_error: Option<String>,
+    /// 是否具备 profileArn（开启 overage 必要条件）
+    pub has_profile_arn: bool,
+    /// 凭据的认证方式（用于前端判断是否可调用 web portal）
+    pub auth_method: Option<String>,
+}
+
+/// Web Portal API 调用上下文
+///
+/// 与 [`CallContext`] 的区别：本上下文用于 app.kiro.dev 的 web portal 接口
+/// （需要 idp + profileArn cookie），不参与负载均衡选择。
+pub struct WebPortalContext {
+    /// 凭据 ID（保留字段，便于上层日志关联，不被读取也保留）
+    #[allow(dead_code)]
+    pub id: u64,
+    pub token: String,
+    pub idp: String,
+    pub profile_arn: Option<String>,
+    pub proxy: Option<ProxyConfig>,
+}
+
 /// 缓存余额信息（用于 Admin API）
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -643,11 +694,20 @@ pub struct CachedBalanceInfo {
     pub cached_at: u64,
     /// 缓存存活时间（秒）
     pub ttl_secs: u64,
+    /// 缓存的总额度（已知 overage 开启时包含超额额度）
+    pub usage_limit: f64,
+    /// 缓存快照里的超额开关状态
+    pub overage_enabled: bool,
+    /// 缓存快照里的超额额度上限（未开启时为 0）
+    pub overage_cap: f64,
 }
 
 /// 余额缓存条目
 struct CachedBalance {
     remaining: f64,
+    usage_limit: f64,
+    overage_enabled: bool,
+    overage_cap: f64,
     cached_at: std::time::Instant,
     /// 是否已初始化（区分"未获取过余额"和"余额为零"）
     initialized: bool,
@@ -889,6 +949,9 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     refresh_token_hash,
+                    overage_enabled: cred.overage_enabled,
+                    overage_enabling: false,
+                    overage_last_error: None,
                 }
             })
             .collect();
@@ -914,6 +977,13 @@ impl MultiTokenManager {
                     e.id,
                     CachedBalance {
                         remaining: 0.0,
+                        usage_limit: 0.0,
+                        overage_enabled: e.overage_enabled.unwrap_or(false),
+                        overage_cap: if e.overage_enabled == Some(true) {
+                            DEFAULT_OVERAGE_CAP
+                        } else {
+                            0.0
+                        },
                         cached_at: now,
                         initialized: false,
                         recent_usage: 0,
@@ -1552,17 +1622,61 @@ impl MultiTokenManager {
 
     /// 更新余额缓存
     pub fn update_balance_cache(&self, id: u64, remaining: f64) {
+        self.update_balance_cache_details(id, remaining, 0.0, None, None);
+    }
+
+    /// 更新余额缓存，并同步 overage/总额度快照，供 Admin UI 凭证卡片直接展示。
+    pub fn update_balance_cache_details(
+        &self,
+        id: u64,
+        remaining: f64,
+        usage_limit: f64,
+        overage_enabled: Option<bool>,
+        overage_cap: Option<f64>,
+    ) {
         let mut cache = self.balance_cache.lock();
         let now = std::time::Instant::now();
         // 保留现有使用计数
-        let (recent_usage, usage_reset_at) = cache
+        let (
+            recent_usage,
+            usage_reset_at,
+            previous_usage_limit,
+            previous_overage_enabled,
+            previous_overage_cap,
+        ) = cache
             .get(&id)
-            .map(|e| (e.recent_usage, e.usage_reset_at))
-            .unwrap_or((0, now));
+            .map(|e| {
+                (
+                    e.recent_usage,
+                    e.usage_reset_at,
+                    e.usage_limit,
+                    e.overage_enabled,
+                    e.overage_cap,
+                )
+            })
+            .unwrap_or((0, now, 0.0, false, 0.0));
+        let known_overage_enabled = overage_enabled.unwrap_or(previous_overage_enabled);
+        let known_overage_cap = overage_cap.unwrap_or(if known_overage_enabled {
+            previous_overage_cap.max(DEFAULT_OVERAGE_CAP)
+        } else {
+            0.0
+        });
+        let known_usage_limit = if usage_limit > 0.0 {
+            usage_limit
+        } else if previous_usage_limit > 0.0 {
+            previous_usage_limit
+        } else if known_overage_enabled {
+            remaining.max(0.0) + known_overage_cap
+        } else {
+            0.0
+        };
         cache.insert(
             id,
             CachedBalance {
                 remaining,
+                usage_limit: known_usage_limit,
+                overage_enabled: known_overage_enabled,
+                overage_cap: known_overage_cap,
                 cached_at: now,
                 initialized: true,
                 recent_usage,
@@ -1590,15 +1704,46 @@ impl MultiTokenManager {
                     .unwrap_or(now_instant)
             });
 
-        let (recent_usage, usage_reset_at) = cache
+        let (
+            recent_usage,
+            usage_reset_at,
+            previous_usage_limit,
+            previous_overage_enabled,
+            previous_overage_cap,
+        ) = cache
             .get(&id)
-            .map(|e| (e.recent_usage, e.usage_reset_at))
-            .unwrap_or((0, now_instant));
+            .map(|e| {
+                (
+                    e.recent_usage,
+                    e.usage_reset_at,
+                    e.usage_limit,
+                    e.overage_enabled,
+                    e.overage_cap,
+                )
+            })
+            .unwrap_or((0, now_instant, 0.0, false, 0.0));
+
+        let known_overage_enabled = previous_overage_enabled;
+        let known_overage_cap = if known_overage_enabled {
+            previous_overage_cap.max(DEFAULT_OVERAGE_CAP)
+        } else {
+            0.0
+        };
+        let known_usage_limit = if previous_usage_limit > 0.0 {
+            previous_usage_limit
+        } else if known_overage_enabled {
+            remaining.max(0.0) + known_overage_cap
+        } else {
+            0.0
+        };
 
         cache.insert(
             id,
             CachedBalance {
                 remaining,
+                usage_limit: known_usage_limit,
+                overage_enabled: known_overage_enabled,
+                overage_cap: known_overage_cap,
                 cached_at: restored_cached_at,
                 initialized: true,
                 recent_usage,
@@ -1643,10 +1788,18 @@ impl MultiTokenManager {
             }
         } else {
             // 缓存条目不存在时创建新条目（余额未知设为 0）
+            let overage_enabled = self.is_overage_known_enabled(id);
             cache.insert(
                 id,
                 CachedBalance {
                     remaining: 0.0,
+                    usage_limit: 0.0,
+                    overage_enabled,
+                    overage_cap: if overage_enabled {
+                        DEFAULT_OVERAGE_CAP
+                    } else {
+                        0.0
+                    },
                     cached_at: now,
                     initialized: false,
                     recent_usage: 1,
@@ -1697,6 +1850,9 @@ impl MultiTokenManager {
                         remaining: cached.remaining,
                         cached_at: cached_at_unix_ms,
                         ttl_secs,
+                        usage_limit: cached.usage_limit,
+                        overage_enabled: cached.overage_enabled,
+                        overage_cap: cached.overage_cap,
                     }
                 })
             })
@@ -2150,9 +2306,9 @@ impl MultiTokenManager {
     /// 报告指定凭据额度已用尽
     ///
     /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
-    /// - 立即禁用该凭据（不等待连续失败阈值）
-    /// - 切换到下一个可用凭据继续重试
-    /// - 返回是否还有可用凭据
+    /// - 未知/未开启 overage 时立即禁用该凭据（不等待连续失败阈值）
+    /// - 已知 overage 已开启时不禁用，避免把基础额度错误当成有效额度上限
+    /// - 返回该凭据是否仍可继续参与后续尝试
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
         let result = {
             let mut entries = self.entries.lock();
@@ -2164,6 +2320,15 @@ impl MultiTokenManager {
 
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
+            }
+
+            if entry.overage_enabled == Some(true) {
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                tracing::warn!(
+                    "凭据 #{} 返回 MONTHLY_REQUEST_COUNT，但已知 overage 已开启；保留启用状态并等待后续余额刷新校准",
+                    id
+                );
+                return true;
             }
 
             entry.disabled = true;
@@ -2357,12 +2522,21 @@ impl MultiTokenManager {
         for (index, &id) in credential_ids.iter().enumerate() {
             match self.get_usage_limits_for(id).await {
                 Ok(limits) => {
-                    // 计算剩余额度
-                    let used = limits.current_usage();
-                    let limit = limits.usage_limit();
-                    let remaining = (limit - used).max(0.0);
+                    // 计算有效剩余额度；开启 overage 时要把额外额度计入，否则基础额度用完会被误禁用
+                    let overage_enabled = limits
+                        .overage_enabled_reported()
+                        .unwrap_or_else(|| self.is_overage_known_enabled(id));
+                    let remaining = limits.remaining_balance_for_overage(overage_enabled);
+                    let usage_limit = limits.effective_usage_limit_for_overage(overage_enabled);
+                    let overage_cap = limits.overage_cap_for_enabled(overage_enabled);
 
-                    self.update_balance_cache(id, remaining);
+                    self.update_balance_cache_details(
+                        id,
+                        remaining,
+                        usage_limit,
+                        Some(overage_enabled),
+                        Some(overage_cap),
+                    );
 
                     // 余额小于 1 时自动禁用凭据
                     if remaining < 1.0 {
@@ -2441,6 +2615,13 @@ impl MultiTokenManager {
                         region: e.credentials.region.clone(),
                         api_region: e.credentials.api_region.clone(),
                         endpoint: e.credentials.endpoint.clone(),
+                        idp: e.credentials.idp.clone(),
+                        proxy_url: e.credentials.proxy_url.clone(),
+                        proxy_username: e.credentials.proxy_username.clone(),
+                        has_proxy_password: e.credentials.proxy_password.is_some(),
+                        overage_enabled: e.overage_enabled,
+                        overage_enabling: e.overage_enabling,
+                        overage_last_error: e.overage_last_error.clone(),
                     }
                 })
                 .collect(),
@@ -2520,6 +2701,219 @@ impl MultiTokenManager {
         }
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 设置凭据级 Web Portal Idp（Admin API）
+    pub fn set_idp_for(&self, id: u64, idp: Option<String>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.idp = idp.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据级代理（Admin API）
+    ///
+    /// `proxy_url == Some("")` 视为清除代理回退到全局；`Some("direct")` 表示显式直连。
+    pub fn set_proxy_for(
+        &self,
+        id: u64,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.proxy_url = proxy_url
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            entry.credentials.proxy_username = proxy_username
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            entry.credentials.proxy_password = proxy_password.filter(|s| !s.is_empty());
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 读取指定凭据的超额状态缓存
+    pub fn overage_status_for(&self, id: u64) -> anyhow::Result<OverageStatusSnapshot> {
+        let entries = self.entries.lock();
+        let entry = entries
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        Ok(OverageStatusSnapshot {
+            id: entry.id,
+            enabled: entry.overage_enabled,
+            enabling: entry.overage_enabling,
+            last_error: entry.overage_last_error.clone(),
+            has_profile_arn: entry.credentials.profile_arn.is_some(),
+            auth_method: entry.credentials.auth_method.clone(),
+        })
+    }
+
+    /// 指定凭据是否已知开启 overage。
+    ///
+    /// 只把 `Some(true)` 视为开启；`None` 表示还没查询到 Web Portal 状态，
+    /// 不能主动推断为关闭。
+    pub fn is_overage_known_enabled(&self, id: u64) -> bool {
+        self.overage_status_for(id)
+            .ok()
+            .and_then(|s| s.enabled)
+            .unwrap_or(false)
+    }
+
+    /// 标记凭据正在执行 overage 开启任务（防止并发重复触发）
+    ///
+    /// 返回 `true` 表示成功获得"独占执行权"，`false` 表示已经有任务在跑。
+    pub fn try_begin_overage_task(&self, id: u64) -> anyhow::Result<bool> {
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        if entry.overage_enabling {
+            return Ok(false);
+        }
+        entry.overage_enabling = true;
+        entry.overage_last_error = None;
+        Ok(true)
+    }
+
+    /// 任务结束时回填结果（成功/失败）
+    pub fn finish_overage_task(&self, id: u64, result: Result<bool, String>) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.overage_enabling = false;
+            let mut should_persist = false;
+            match result {
+                Ok(enabled) => {
+                    entry.overage_enabled = Some(enabled);
+                    entry.credentials.overage_enabled = Some(enabled);
+                    entry.overage_last_error = None;
+                    should_persist = true;
+                }
+                Err(err) => {
+                    entry.overage_last_error = Some(err);
+                }
+            }
+            drop(entries);
+            if should_persist {
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Overage 状态持久化失败（不影响本次状态更新）: {}", e);
+                }
+            }
+        }
+    }
+
+    /// 仅刷新 overage_enabled 状态（不影响 enabling/last_error 标志）
+    pub fn record_overage_status(&self, id: u64, enabled: bool) {
+        let mut should_persist = false;
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.overage_enabled = Some(enabled);
+            if entry.credentials.overage_enabled != Some(enabled) {
+                entry.credentials.overage_enabled = Some(enabled);
+                should_persist = true;
+            }
+        }
+        drop(entries);
+        if should_persist {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("Overage 状态持久化失败（不影响本次状态更新）: {}", e);
+            }
+        }
+    }
+
+    /// 获取指定凭据的 web portal 调用上下文（access_token + idp + profile_arn + 代理）
+    ///
+    /// 内部确保 token 有效（必要时刷新），仅供 web portal API 使用，
+    /// 不影响 acquire_context 的负载均衡选择。
+    pub async fn web_portal_context_for(&self, id: u64) -> anyhow::Result<WebPortalContext> {
+        let config = self.config.read().clone();
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        if credentials.is_api_key_credential() {
+            anyhow::bail!("API Key 凭据不支持 Web Portal 接口");
+        }
+
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+        let final_creds = if needs_refresh {
+            let _guard = self.refresh_lock.lock().await;
+            let current = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+            if is_token_expired(&current) || is_token_expiring_soon(&current) {
+                let proxy = self.proxy.read().clone();
+                let new_creds = refresh_token_with_id(&current, &config, proxy.as_ref(), id)
+                    .await
+                    .inspect_err(|err| {
+                        if is_invalid_grant_error(err) {
+                            self.mark_authentication_failed(id);
+                        }
+                    })?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                        entry.refresh_token_hash = credential_secret_hash(&new_creds);
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                new_creds
+            } else {
+                current
+            }
+        } else {
+            credentials
+        };
+
+        let token = final_creds
+            .access_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+        let profile_arn = final_creds
+            .profile_arn
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+        let idp = final_creds.effective_idp().to_string();
+        if idp.is_empty() {
+            anyhow::bail!(
+                "凭据未提供 idp 且无法从 auth_method 推断（仅 social 凭据支持 Web Portal）"
+            );
+        }
+        let proxy = final_creds.effective_proxy(self.proxy.read().as_ref());
+        Ok(WebPortalContext {
+            id,
+            token,
+            idp,
+            profile_arn,
+            proxy,
+        })
     }
 
     /// 重置凭据失败计数并重新启用（Admin API）
@@ -2669,20 +3063,37 @@ impl MultiTokenManager {
         let config = self.config.read().clone();
         match get_usage_limits(&credentials, &config, &token, proxy.as_ref()).await {
             Ok(usage) => {
+                let subscription_title = usage.subscription_title().map(|title| title.to_string());
+                let reported_overage_enabled = usage.overage_enabled_reported();
                 let mut should_persist = false;
-                if let Some(subscription_title) = usage.subscription_title() {
+
+                {
                     let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id)
-                        && entry.credentials.subscription_title.as_deref()
-                            != Some(subscription_title)
-                    {
-                        entry.credentials.subscription_title = Some(subscription_title.to_string());
-                        should_persist = true;
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        if let Some(subscription_title) = subscription_title.as_deref() {
+                            if entry.credentials.subscription_title.as_deref()
+                                != Some(subscription_title)
+                            {
+                                entry.credentials.subscription_title =
+                                    Some(subscription_title.to_string());
+                                should_persist = true;
+                            }
+                        }
+
+                        if let Some(enabled) = reported_overage_enabled {
+                            entry.overage_enabled = Some(enabled);
+                            if entry.credentials.overage_enabled != Some(enabled) {
+                                entry.credentials.overage_enabled = Some(enabled);
+                                should_persist = true;
+                            }
+                        }
                     }
                 }
 
-                if should_persist && let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+                if should_persist {
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("凭据用量状态更新后持久化失败（不影响本次请求）: {}", e);
+                    }
                 }
 
                 Ok(usage)
@@ -2798,6 +3209,9 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 refresh_token_hash: entry_secret_hash,
+                overage_enabled: None,
+                overage_enabling: false,
+                overage_last_error: None,
             });
         }
 
@@ -2833,6 +3247,9 @@ impl MultiTokenManager {
                 new_id,
                 CachedBalance {
                     remaining: baseline_balance,
+                    usage_limit: 0.0,
+                    overage_enabled: false,
+                    overage_cap: 0.0,
                     cached_at: now,
                     initialized: true,
                     recent_usage: baseline_usage,
@@ -3249,6 +3666,21 @@ mod tests {
         assert!(result.err().unwrap().to_string().contains("凭据已存在"));
     }
 
+    #[test]
+    fn test_multi_token_manager_restores_persisted_overage_status() {
+        let config = Config::default();
+        let cred = KiroCredentials {
+            overage_enabled: Some(true),
+            ..Default::default()
+        };
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let status = manager.overage_status_for(1).unwrap();
+
+        assert_eq!(status.enabled, Some(true));
+        assert_eq!(manager.snapshot().entries[0].overage_enabled, Some(true));
+    }
+
     // MultiTokenManager 测试
 
     #[test]
@@ -3445,6 +3877,23 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_multi_token_manager_quota_exhausted_does_not_disable_known_overage_enabled() {
+        let config = Config::default();
+        let cred = KiroCredentials {
+            overage_enabled: Some(true),
+            ..Default::default()
+        };
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        assert!(manager.report_quota_exhausted(1));
+        assert_eq!(manager.available_count(), 1);
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.entries[0].disabled);
+        assert_eq!(snapshot.entries[0].disable_reason, None);
     }
 
     #[tokio::test]

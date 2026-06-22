@@ -74,13 +74,13 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     // $schema：缺失不补；存在但非合法非空字符串才纠正。
-    if let Some(v) = obj.get("$schema") {
-        if v.as_str().is_none_or(|s| s.is_empty()) {
-            obj.insert(
-                "$schema".to_string(),
-                serde_json::Value::String("http://json-schema.org/draft-07/schema#".to_string()),
-            );
-        }
+    if let Some(v) = obj.get("$schema")
+        && v.as_str().is_none_or(|s| s.is_empty())
+    {
+        obj.insert(
+            "$schema".to_string(),
+            serde_json::Value::String("http://json-schema.org/draft-07/schema#".to_string()),
+        );
     }
 
     // type（必须是字符串）—— 这是 MCP 异常的常见目标，保留缺失补默认。
@@ -118,13 +118,14 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     obj.insert("required".to_string(), required);
 
     // additionalProperties：缺失不补；存在但非 bool/object 才纠正为 true。
-    if let Some(v) = obj.get("additionalProperties") {
-        if !v.is_boolean() && !v.is_object() {
-            obj.insert(
-                "additionalProperties".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
+    if let Some(v) = obj.get("additionalProperties")
+        && !v.is_boolean()
+        && !v.is_object()
+    {
+        obj.insert(
+            "additionalProperties".to_string(),
+            serde_json::Value::Bool(true),
+        );
     }
 
     serde_json::Value::Object(obj)

@@ -20,9 +20,23 @@ use crate::http_client::{ProxyConfig, build_client};
 #[allow(dead_code)]
 const KIRO_API_BASE: &str = "https://app.kiro.dev/service/KiroWebPortalService/operation";
 #[allow(dead_code)]
+const KIRO_HOME_URL: &str = "https://app.kiro.dev/";
+#[allow(dead_code)]
 const SMITHY_PROTOCOL: &str = "rpc-v2-cbor";
 const AMZ_SDK_REQUEST: &str = "attempt=1; max=1";
 const X_AMZ_USER_AGENT: &str = "aws-sdk-js/1.0.0 kiro-rs/1.0.0";
+
+/// 调用写操作（如 UpdateBillingPreferences）必需的 CSRF 会话上下文
+///
+/// 通过带 Cookie 访问 `https://app.kiro.dev/` 拿到 HTML，从两个 meta 标签提取：
+/// - `<meta name="csrf-token" content="...">` —— 写操作必须放进 `X-CSRF-Token` header；
+/// - `<meta name="user-id" content="...">` —— 服务端会在 HTML 响应里 Set-Cookie `UserId=...`，
+///   后续写操作的 Cookie 必须把它带回去（CSRF 校验依赖这个 cookie）。
+#[derive(Debug, Clone)]
+struct CsrfSession {
+    csrf_token: String,
+    user_id: String,
+}
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,7 +138,7 @@ pub struct UsageAndLimitsResponse {
     pub user_info: Option<UsageUserInfo>,
     pub subscription_info: Option<SubscriptionInfo>,
     pub usage_breakdown_list: Option<Vec<UsageBreakdownItem>>,
-    pub next_date_reset: Option<String>,
+    pub next_date_reset: Option<f64>,
     pub overage_configuration: Option<OverageConfiguration>,
 }
 
@@ -139,7 +153,11 @@ fn header_value(s: &str, name: &'static str) -> anyhow::Result<HeaderValue> {
     HeaderValue::from_str(s).with_context(|| format!("{} header 无效", name))
 }
 
-fn build_headers(access_token: &str, idp: &str) -> anyhow::Result<HeaderMap> {
+fn build_headers(
+    access_token: &str,
+    idp: &str,
+    csrf: Option<&CsrfSession>,
+) -> anyhow::Result<HeaderMap> {
     let mut headers = HeaderMap::new();
 
     headers.insert(ACCEPT, HeaderValue::from_static("application/cbor"));
@@ -160,16 +178,79 @@ fn build_headers(access_token: &str, idp: &str) -> anyhow::Result<HeaderMap> {
         header_value(&format!("Bearer {}", access_token), "authorization")?,
     );
 
-    // Kiro-account-manager 里同时带了 Idp / AccessToken cookie。
-    headers.insert(
-        COOKIE,
-        header_value(
-            &format!("Idp={}; AccessToken={}", idp, access_token),
-            "cookie",
-        )?,
-    );
+    // Cookie 顺序：Idp / AccessToken 是基础鉴权；UserId 仅在写操作（带 CSRF）时附加，
+    // 上游 CSRF 校验需要它和 X-CSRF-Token 一起回传。
+    let cookie = match csrf {
+        Some(s) => format!(
+            "Idp={}; AccessToken={}; UserId={}",
+            idp, access_token, s.user_id
+        ),
+        None => format!("Idp={}; AccessToken={}", idp, access_token),
+    };
+    headers.insert(COOKIE, header_value(&cookie, "cookie")?);
+
+    if let Some(s) = csrf {
+        headers.insert("x-csrf-token", header_value(&s.csrf_token, "x-csrf-token")?);
+    }
 
     Ok(headers)
+}
+
+/// 获取 CSRF 会话上下文。
+///
+/// 实际请求 `https://app.kiro.dev/`（带 Idp / AccessToken Cookie），从 HTML 的
+/// `<meta name="csrf-token">` 和 `<meta name="user-id">` 抽取两个值。
+///
+/// 上游对未登录用户返回的 HTML 里这两个 meta 都是占位注释（`<!-- CSRF token not available... -->`），
+/// 所以 token 失效或 idp 错误会立刻在这里失败，便于早判错。
+async fn fetch_csrf_session(
+    access_token: &str,
+    idp: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<CsrfSession> {
+    let client = build_client(proxy, 30, crate::model::config::TlsBackend::NativeTls)?;
+    let resp = client
+        .get(KIRO_HOME_URL)
+        .header(
+            COOKIE,
+            header_value(
+                &format!("Idp={}; AccessToken={}", idp, access_token),
+                "cookie",
+            )?,
+        )
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .context("获取 CSRF 会话页失败")?;
+
+    let status = resp.status();
+    let html = resp.text().await.context("读取 CSRF 会话页响应失败")?;
+    if !status.is_success() {
+        anyhow::bail!("获取 CSRF 会话页失败：HTTP {}", status);
+    }
+
+    let csrf_token = extract_meta(&html, "csrf-token")
+        .ok_or_else(|| anyhow::anyhow!("HTML 未包含 csrf-token meta（access_token 可能已失效）"))?;
+    let user_id = extract_meta(&html, "user-id")
+        .ok_or_else(|| anyhow::anyhow!("HTML 未包含 user-id meta（access_token 可能已失效）"))?;
+
+    Ok(CsrfSession {
+        csrf_token,
+        user_id,
+    })
+}
+
+/// 从 HTML 中提取 `<meta name="<name>" content="...">` 的 content。
+///
+/// 简单匹配，仅供 CSRF/User-ID 这两个固定 meta 使用。
+fn extract_meta(html: &str, name: &str) -> Option<String> {
+    let needle = format!("name=\"{}\"", name);
+    let idx = html.find(&needle)?;
+    let tail = &html[idx..];
+    let content_idx = tail.find("content=\"")?;
+    let after = &tail[content_idx + "content=\"".len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
 }
 
 async fn request_cbor<TResp, TReq>(
@@ -178,6 +259,7 @@ async fn request_cbor<TResp, TReq>(
     access_token: &str,
     idp: &str,
     proxy: Option<&ProxyConfig>,
+    csrf: Option<&CsrfSession>,
 ) -> anyhow::Result<TResp>
 where
     TResp: for<'de> serde::Deserialize<'de>,
@@ -191,7 +273,7 @@ where
 
     let resp = client
         .post(&url)
-        .headers(build_headers(access_token, idp)?)
+        .headers(build_headers(access_token, idp, csrf)?)
         .timeout(Duration::from_secs(60))
         .body(body)
         .send()
@@ -234,6 +316,7 @@ pub async fn get_user_info(
         access_token,
         idp,
         proxy,
+        None,
     )
     .await
 }
@@ -252,8 +335,72 @@ pub async fn get_user_usage_and_limits(
         access_token,
         idp,
         proxy,
+        None,
     )
     .await
+}
+
+// ============================================================================
+// UpdateBillingPreferences —— 用于开启/关闭超额（overage）
+// ============================================================================
+
+/// UpdateBillingPreferences 请求体里的超额配置子结构
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateOverageConfiguration {
+    pub overage_enabled: bool,
+}
+
+/// UpdateBillingPreferences 请求体
+///
+/// 抓包验证：POST /service/KiroWebPortalService/operation/UpdateBillingPreferences
+/// CBOR 体形如 `{ overageConfiguration: { overageEnabled: true }, profileArn: "arn:..." }`
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateBillingPreferencesRequest {
+    pub overage_configuration: UpdateOverageConfiguration,
+    pub profile_arn: String,
+}
+
+/// UpdateBillingPreferences 响应（上游返回空对象，用 IgnoredAny 接收）
+#[derive(Debug, serde::Deserialize)]
+struct UpdateBillingPreferencesResponse {
+    #[serde(flatten, default)]
+    _ignored: serde::de::IgnoredAny,
+}
+
+/// 调用 UpdateBillingPreferences 开启或关闭超额
+///
+/// 必须传入 profileArn，否则上游会返回 400/ValidationException。
+///
+/// 写操作流程：
+/// 1. 先 GET `https://app.kiro.dev/` 拿 CSRF token + UserId（[`fetch_csrf_session`]）；
+/// 2. 然后 POST 操作时附加 `X-CSRF-Token` header 与 `UserId` cookie，
+///    上游缺一不可（错误信息分别是 "CSRF token is required" / "Invalid CSRF token"）。
+pub async fn update_billing_preferences(
+    access_token: &str,
+    idp: &str,
+    profile_arn: &str,
+    overage_enabled: bool,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<()> {
+    if profile_arn.trim().is_empty() {
+        anyhow::bail!("UpdateBillingPreferences 需要 profileArn，但凭据未提供");
+    }
+    let csrf = fetch_csrf_session(access_token, idp, proxy).await?;
+    let _resp: UpdateBillingPreferencesResponse = request_cbor(
+        "UpdateBillingPreferences",
+        &UpdateBillingPreferencesRequest {
+            overage_configuration: UpdateOverageConfiguration { overage_enabled },
+            profile_arn: profile_arn.to_string(),
+        },
+        access_token,
+        idp,
+        proxy,
+        Some(&csrf),
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -281,7 +428,9 @@ pub struct CreditsUsageSummary {
 
     pub bonuses: Vec<CreditBonus>,
 
-    pub next_reset_date: Option<String>,
+    /// 上游用 epoch 秒（可能带小数），与 GetUserUsageAndLimits 的
+    /// `nextDateReset` 字段一致；前端按需要本地化展示。
+    pub next_reset_date: Option<f64>,
     pub overage_enabled: Option<bool>,
 
     pub resource_detail: Option<CreditsResourceDetail>,

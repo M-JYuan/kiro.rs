@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, Trash2, RotateCcw, CheckCircle2, Globe, ArrowUp, ArrowDown } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, Trash2, RotateCcw, CheckCircle2, Globe, ArrowUp, ArrowDown, Boxes } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -12,6 +12,7 @@ import { ImportTokenJsonDialog } from '@/components/import-token-json-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ProxyConfigDialog } from '@/components/proxy-config-dialog'
 import { GlobalConfigDialog } from '@/components/global-config-dialog'
+import { AvailableModelsDialog } from '@/components/available-models-dialog'
 import { useCredentials, useCachedBalances, useDeleteCredential, useResetFailure, useForceRefreshToken, useProxyConfig, useGlobalConfig } from '@/hooks/use-credentials'
 import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -35,6 +36,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [proxyConfigDialogOpen, setProxyConfigDialogOpen] = useState(false)
   const [globalConfigDialogOpen, setGlobalConfigDialogOpen] = useState(false)
+  const [availableModelsDialogOpen, setAvailableModelsDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
@@ -63,14 +65,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: proxyConfig } = useProxyConfig()
   const { data: globalConfig } = useGlobalConfig()
 
+  // 派生数据必须在所有早退 return 之前计算，避免登录后 hook 顺序变化。
+  // 但对尚未加载完成的 query 数据要给安全默认值，否则某个非关键
+  // query 短暂返回 undefined 时会让 Dashboard 渲染阶段抛错，React 19
+  // 在当前生产构建下表现为 root 被清空（白屏）。
+  const credentials = data?.credentials ?? []
+
   // 构建 id -> cachedBalance 的映射
-  const cachedBalanceMap = new Map(
-    cachedBalancesData?.balances.map((b) => [b.id, b]) ?? []
+  const cachedBalanceMap = useMemo(
+    () => new Map(
+      (cachedBalancesData?.balances ?? []).map((b) => [b.id, b])
+    ),
+    [cachedBalancesData?.balances]
   )
 
   // 排序后的凭据列表
   const sortedCredentials = useMemo(() => {
-    const credentials = data?.credentials || []
     if (sortField === 'default') return credentials
 
     return [...credentials].sort((a, b) => {
@@ -84,7 +94,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       }
       return sortOrder === 'asc' ? cmp : -cmp
     })
-  }, [data?.credentials, sortField, sortOrder, cachedBalanceMap])
+  }, [credentials, sortField, sortOrder, cachedBalanceMap])
 
   // 计算分页
   const totalPages = Math.ceil(sortedCredentials.length / itemsPerPage)
@@ -419,6 +429,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
           next.set(id, balance)
           return next
         })
+        queryClient.setQueryData(['credential-balance', id], balance)
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        queryClient.invalidateQueries({ queryKey: ['cached-balances'] })
       } catch (error) {
         failCount++
       } finally {
@@ -484,6 +497,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
       try {
         const balance = await getCredentialBalance(id)
         successCount++
+        queryClient.setQueryData(['credential-balance', id], balance)
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        queryClient.invalidateQueries({ queryKey: ['cached-balances'] })
 
         // 更新为成功状态
         setVerifyResults(prev => {
@@ -568,6 +584,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <span className="font-semibold">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setAvailableModelsDialogOpen(true)}>
+              <Boxes className="h-4 w-4 mr-2" />
+              可用模型
+            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -618,7 +638,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <CardContent>
               <div className="text-xs space-y-0.5">
                 <div className="truncate">{globalConfig?.region || '-'} | RPM: {globalConfig?.credentialRpm ?? '默认'}</div>
-                <div className="truncate">Endpoint: {globalConfig?.defaultEndpoint || 'ide'} | 压缩: {globalConfig?.compression.enabled ? '开' : '关'}</div>
+                <div className="truncate">Endpoint: {globalConfig?.defaultEndpoint || 'ide'} | 压缩: {globalConfig?.compression?.enabled ? '开' : '关'}</div>
                 <div className="truncate">代理: {proxyConfig?.proxyUrl || '无'}</div>
               </div>
             </CardContent>
@@ -815,6 +835,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <GlobalConfigDialog
         open={globalConfigDialogOpen}
         onOpenChange={setGlobalConfigDialogOpen}
+      />
+
+      {/* 全局可用模型对话框 */}
+      <AvailableModelsDialog
+        open={availableModelsDialogOpen}
+        onOpenChange={setAvailableModelsDialogOpen}
       />
 
       {/* 全局代理配置对话框（保留兼容） */}
